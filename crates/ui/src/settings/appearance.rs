@@ -174,6 +174,7 @@ fn nearest_mono_ix(size: f32) -> usize {
 }
 
 pub struct AppearancePage {
+    scroll: crate::settings::widgets::PageScroll,
     selected_font: UiFontFamily,
     selected_terminal_font: UiFontFamily,
     selected_code_font: UiFontFamily,
@@ -189,6 +190,13 @@ pub struct AppearancePage {
     font_menu: Popup<()>,
     terminal_font_menu: Popup<()>,
     code_font_menu: Popup<()>,
+    /// Floating rail for each family dropdown (the menu-scrollbar treatment,
+    /// on the menu's own scroll host). One per kind: the menus scroll
+    /// independently, so sharing a state would carry one menu's offset and
+    /// rail timers into the next one opened.
+    font_list: widgets::PageScroll,
+    terminal_font_list: widgets::PageScroll,
+    code_font_list: widgets::PageScroll,
     size_menu: Popup<()>,
     terminal_size_menu: Popup<()>,
     code_size_menu: Popup<()>,
@@ -224,6 +232,7 @@ impl AppearancePage {
             }
         });
         Self {
+            scroll: crate::settings::widgets::PageScroll::default(),
             selected_font: typography::effective(cx),
             selected_terminal_font: typography::terminal_effective(cx),
             selected_code_font: typography::code_effective(cx),
@@ -239,6 +248,9 @@ impl AppearancePage {
             font_menu: Popup::default(),
             terminal_font_menu: Popup::default(),
             code_font_menu: Popup::default(),
+            font_list: widgets::PageScroll::default(),
+            terminal_font_list: widgets::PageScroll::default(),
+            code_font_list: widgets::PageScroll::default(),
             size_menu: Popup::default(),
             terminal_size_menu: Popup::default(),
             code_size_menu: Popup::default(),
@@ -272,6 +284,14 @@ impl AppearancePage {
             FontKind::Ui => &mut self.font_menu,
             FontKind::Terminal => &mut self.terminal_font_menu,
             FontKind::Code => &mut self.code_font_menu,
+        }
+    }
+
+    fn font_list_mut(&mut self, kind: FontKind) -> &mut widgets::PageScroll {
+        match kind {
+            FontKind::Ui => &mut self.font_list,
+            FontKind::Terminal => &mut self.terminal_font_list,
+            FontKind::Code => &mut self.code_font_list,
         }
     }
 
@@ -502,6 +522,9 @@ impl AppearancePage {
                 .update(cx, |input, cx| input.set_text("", cx));
             let effective = kind.effective(cx);
             self.set_selected_font(kind, effective);
+            // Every open starts at the top, and the rail's baseline with it —
+            // no reopen flash from the previous session's offset.
+            self.font_list_mut(kind).reset();
             self.font_menu_mut(kind).open(());
             window.focus(&self.font_search.read(cx).focus_handle(cx), cx);
         }
@@ -810,6 +833,24 @@ impl AppearancePage {
             }
         }
         cx.notify();
+    }
+
+    fn on_scroll_hovered(&mut self, hovered: &bool, _: &mut Window, cx: &mut Context<Self>) {
+        if self.scroll.set_list_hovered(*hovered) {
+            cx.notify();
+        }
+    }
+}
+
+impl popover::ScrollRailHost for AppearancePage {
+    // The page's rail; each font dropdown's rail goes through
+    // [`widgets::rail`], which can serve further scroll hosts on the same view.
+    fn rail_bar(&mut self) -> &mut popover::MenuScrollbarState {
+        self.scroll.rail_bar()
+    }
+
+    fn rail_scroll(&self) -> Option<gpui::ScrollHandle> {
+        self.scroll.rail_scroll()
     }
 }
 
@@ -1463,6 +1504,21 @@ impl AppearancePage {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let slug = kind.slug();
+        // The scroll helpers key off `&'static str`, so the ids are spelled
+        // out rather than formatted from the slug.
+        let (host_id, list_id, rail_id) = match kind {
+            FontKind::Ui => (
+                "interface-font-host",
+                "interface-font-scroll",
+                "interface-font-scrollbar",
+            ),
+            FontKind::Terminal => (
+                "terminal-font-host",
+                "terminal-font-scroll",
+                "terminal-font-scrollbar",
+            ),
+            FontKind::Code => ("code-font-host", "code-font-scroll", "code-font-scrollbar"),
+        };
         let effective = kind.effective(cx);
         let selected = self.selected_font(kind).clone();
         let visible = self.visible_choices(kind, availability, cx);
@@ -1510,14 +1566,28 @@ impl AppearancePage {
                 }))
                 .into_any_element()
         } else {
-            div()
-                .id(SharedString::from(format!("{slug}-font-scroll")))
-                .max_h(px(280.0))
-                .overflow_y_scroll()
-                .flex()
-                .flex_col()
-                .gap(px(2.0))
-                .children(rows)
+            // Card-bleed scroll host (see [`popover::menu_scroll_host`]): the
+            // rail mounts as a sibling of the scroller, above its clip. The
+            // bleed stays horizontal — the search input sits above the list.
+            let rail = widgets::rail(self.font_list_mut(kind), rail_id, theme, cx, move |page| {
+                page.font_list_mut(kind)
+            });
+            let scroll = self.font_list_mut(kind).scroll.clone();
+            popover::menu_scroll_host(host_id)
+                .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                    if this.font_list_mut(kind).set_list_hovered(*hovered) {
+                        cx.notify();
+                    }
+                }))
+                .child(
+                    popover::menu_scroll_list(list_id, &scroll)
+                        .max_h(px(280.0))
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.0))
+                        .children(rows),
+                )
+                .children(rail)
                 .into_any_element()
         };
 
@@ -3037,42 +3107,52 @@ impl Render for AppearancePage {
             }
         }
 
+        let scrollbar = popover::rail(self, "appearance-page-scrollbar", &theme, cx);
         div()
-            .id("appearance-page")
+            .id("appearance-page-host")
+            .relative()
             .size_full()
-            .overflow_y_scroll()
+            .on_hover(cx.listener(Self::on_scroll_hovered))
             .child(
-                widgets::page_column()
-                    .child(widgets::page_header(&theme, "Appearance", None))
+                div()
+                    .id("appearance-page")
+                    .size_full()
+                    .overflow_y_scroll()
+                    .track_scroll(&self.scroll.scroll)
                     .child(
-                        widgets::page_subtitle(
-                            &theme,
-                            "Choose how Zeron looks. These settings stay on this device.",
-                        )
-                        .max_w(px(512.0))
-                        .line_height(px(20.0)),
-                    )
-                    .child(
-                        div()
-                            .mt(px(32.0))
-                            .flex()
-                            .flex_col()
-                            .gap(px(12.0))
-                            .child(widgets::field_label(&theme, "Appearance"))
-                            .child(widgets::option_card_row().children(cards)),
-                    )
-                    .child(widgets::section_card(&theme).children(settings_rows))
-                    .child(font_section)
-                    .when_some(library_warning, |page, warning| {
-                        page.child(
-                            div()
-                                .mt(px(8.0))
-                                .text_size(crate::typography::ui_rems(11.5))
-                                .text_color(theme.warning)
-                                .child(warning),
-                        )
-                    }),
+                        widgets::page_column()
+                            .child(widgets::page_header(&theme, "Appearance", None))
+                            .child(
+                                widgets::page_subtitle(
+                                    &theme,
+                                    "Choose how Zeron looks. These settings stay on this device.",
+                                )
+                                .max_w(px(512.0))
+                                .line_height(px(20.0)),
+                            )
+                            .child(
+                                div()
+                                    .mt(px(32.0))
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(12.0))
+                                    .child(widgets::field_label(&theme, "Appearance"))
+                                    .child(widgets::option_card_row().children(cards)),
+                            )
+                            .child(widgets::section_card(&theme).children(settings_rows))
+                            .child(font_section)
+                            .when_some(library_warning, |page, warning| {
+                                page.child(
+                                    div()
+                                        .mt(px(8.0))
+                                        .text_size(crate::typography::ui_rems(11.5))
+                                        .text_color(theme.warning)
+                                        .child(warning),
+                                )
+                            }),
+                    ),
             )
+            .children(scrollbar)
             .children(modal)
     }
 }
