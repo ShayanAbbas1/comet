@@ -1,7 +1,10 @@
 //! Device-local interface typography: bundled font registration, the persisted
 //! catalog choice, and the effective family installed into [`crate::theme::Theme`].
 
-use std::{borrow::Cow, collections::BTreeSet};
+use std::{
+    borrow::Cow,
+    collections::{BTreeMap, BTreeSet},
+};
 
 use gpui::{App, Global, Rems, SharedString, Window, px, rems};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -135,6 +138,7 @@ pub struct FontAvailability {
     geist: bool,
     geist_mono: bool,
     choices: Vec<UiFontFamily>,
+    fixed_width: Vec<UiFontFamily>,
 }
 
 impl FontAvailability {
@@ -150,11 +154,20 @@ impl FontAvailability {
                 UiFontFamily::Installed("Arial".into()),
                 UiFontFamily::Installed("Menlo".into()),
             ],
+            fixed_width: vec![
+                UiFontFamily::GeistMono,
+                UiFontFamily::Installed("Menlo".into()),
+            ],
         }
     }
 
     pub fn choices(&self) -> &[UiFontFamily] {
         &self.choices
+    }
+
+    /// Families whose glyph advances match the terminal renderer's cell grid.
+    pub fn fixed_width_choices(&self) -> &[UiFontFamily] {
+        &self.fixed_width
     }
 
     pub fn is_available(&self, family: &UiFontFamily) -> bool {
@@ -164,6 +177,10 @@ impl FontAvailability {
             UiFontFamily::System => true,
             UiFontFamily::Installed(_) => self.choices.contains(family),
         }
+    }
+
+    pub fn is_fixed_width_available(&self, family: &UiFontFamily) -> bool {
+        self.is_available(family) && self.fixed_width.contains(family)
     }
 
     fn fallback(&self) -> UiFontFamily {
@@ -193,6 +210,7 @@ impl FontAvailability {
             UiFontFamily::System => {}
             UiFontFamily::Installed(_) => self.choices.retain(|choice| choice != family),
         }
+        self.fixed_width.retain(|choice| choice != family);
         self
     }
 }
@@ -203,14 +221,16 @@ impl Default for FontAvailability {
             geist: false,
             geist_mono: false,
             choices: vec![UiFontFamily::System],
+            fixed_width: Vec::new(),
         }
     }
 }
 
 /// Requested and effective typography for the process.
 ///
-/// The three categories (interface, terminal, code/diff) pick from the same
-/// catalog: nerd fonts and proportional faces are legal everywhere on purpose.
+/// Interface and code/diff pick from the whole catalog — they lay text out
+/// naturally, so proportional faces are legal. The terminal paints into a cell
+/// grid sized by the `m` advance, so it picks from the fixed-width subset only.
 pub struct TypographyState {
     pub requested: UiFontFamily,
     pub effective: UiFontFamily,
@@ -268,29 +288,66 @@ fn register_family(cx: &App, family: &UiFontFamily, faces: &'static [&'static [u
     }
 }
 
-/// Families that contain the Latin glyph GPUI relies on for text metrics.
+/// Relative spread the sampled advances may show and still count as fixed
+/// width. Hinting and rounding leave sub-unit differences in real mono faces;
+/// proportional faces differ by whole multiples, never a percent.
+const FIXED_WIDTH_TOLERANCE: f32 = 0.01;
+
+/// Whether a face satisfies the terminal renderer's assumption that every
+/// Latin cell is one `m` wide.
+///
+/// The PANOSE bit and `fontdb`'s `monospaced` flag are metadata a font can set
+/// wrongly; what the grid actually needs is equal advances, so measure them.
+fn face_is_fixed_width(font: &ttf_parser::Face) -> bool {
+    let Some(advances) = ['i', 'm', 'W', '0']
+        .iter()
+        .map(|ch| {
+            font.glyph_index(*ch)
+                .and_then(|id| font.glyph_hor_advance(id))
+        })
+        .collect::<Option<Vec<_>>>()
+    else {
+        return false;
+    };
+    let (min, max) = (
+        advances.iter().copied().min().unwrap_or(0),
+        advances.iter().copied().max().unwrap_or(0),
+    );
+    min > 0 && f32::from(max - min) <= FIXED_WIDTH_TOLERANCE * f32::from(min)
+}
+
+/// Families that contain the Latin glyph GPUI relies on for text metrics,
+/// mapped to whether every one of their faces is fixed width.
 ///
 /// `all_font_names` intentionally reports every system family, including
 /// script-specific and symbol fonts. GPUI must reject a face without `m`, but
 /// doing that only after it has been selected both falls back silently and
 /// emits a warning. Inspect the installed files first so those families never
 /// appear in an interface-font picker.
-fn installed_families_with_latin_metrics() -> BTreeSet<String> {
+fn installed_families_with_latin_metrics() -> BTreeMap<String, bool> {
     let mut database = fontdb::Database::new();
     database.load_system_fonts();
 
-    database
-        .faces()
-        .filter(|face| {
-            database
-                .with_face_data(face.id, |data, index| {
-                    ttf_parser::Face::parse(data, index)
-                        .is_ok_and(|font| font.glyph_index('m').is_some())
-                })
-                .unwrap_or(false)
-        })
-        .flat_map(|face| face.families.iter().map(|(name, _)| name.clone()))
-        .collect()
+    let mut families = BTreeMap::new();
+    for face in database.faces() {
+        let Some(Some(fixed_width)) = database.with_face_data(face.id, |data, index| {
+            ttf_parser::Face::parse(data, index)
+                .ok()
+                .filter(|font| font.glyph_index('m').is_some())
+                .map(|font| face_is_fixed_width(&font))
+        }) else {
+            continue;
+        };
+        for (name, _) in &face.families {
+            // Selecting a family selects all its faces, so one proportional
+            // italic is enough to break the grid.
+            families
+                .entry(name.clone())
+                .and_modify(|all_fixed| *all_fixed &= fixed_width)
+                .or_insert(fixed_width);
+        }
+    }
+    families
 }
 
 /// Register each family independently so one bad optional asset cannot hide
@@ -305,7 +362,7 @@ pub fn register_fonts(cx: &App) -> FontAvailability {
         .into_iter()
         .filter(|name| !name.starts_with('.'))
         .filter(|name| name != "Geist" && name != "Geist Mono")
-        .filter(|name| families_with_latin_metrics.contains(name))
+        .filter(|name| families_with_latin_metrics.contains_key(name))
         .collect();
     let geist = register_family(cx, &UiFontFamily::Geist, &GEIST);
     let geist_mono = register_family(cx, &UiFontFamily::GeistMono, &GEIST_MONO);
@@ -314,11 +371,18 @@ pub fn register_fonts(cx: &App) -> FontAvailability {
         UiFontFamily::GeistMono,
         UiFontFamily::System,
     ];
-    choices.extend(system_names.into_iter().map(UiFontFamily::Installed));
+    let mut fixed_width = vec![UiFontFamily::GeistMono];
+    for name in system_names {
+        if families_with_latin_metrics.get(&name) == Some(&true) {
+            fixed_width.push(UiFontFamily::Installed(name.clone()));
+        }
+        choices.push(UiFontFamily::Installed(name));
+    }
     FontAvailability {
         geist,
         geist_mono,
         choices,
+        fixed_width,
     }
 }
 
@@ -330,11 +394,20 @@ fn resolve_effective(requested: &UiFontFamily, availability: &FontAvailability) 
     }
 }
 
+/// `fixed_width_only` guards the terminal grid: a settings file may already
+/// name a proportional family, which must fall back rather than render cells
+/// the painted glyphs do not fill.
 fn resolve_effective_mono(
     requested: &UiFontFamily,
     availability: &FontAvailability,
+    fixed_width_only: bool,
 ) -> UiFontFamily {
-    if availability.is_available(requested) {
+    let usable = if fixed_width_only {
+        availability.is_fixed_width_available(requested)
+    } else {
+        availability.is_available(requested)
+    };
+    if usable {
         requested.clone()
     } else {
         availability.fallback_mono()
@@ -354,8 +427,8 @@ pub fn init(
     cx: &mut App,
 ) {
     let effective = resolve_effective(&requested, &availability);
-    let terminal_effective = resolve_effective_mono(&terminal_requested, &availability);
-    let code_effective = resolve_effective_mono(&code_requested, &availability);
+    let terminal_effective = resolve_effective_mono(&terminal_requested, &availability, true);
+    let code_effective = resolve_effective_mono(&code_requested, &availability, false);
     cx.set_global(TypographyState {
         requested,
         effective,
@@ -452,10 +525,6 @@ pub fn generation(cx: &App) -> u32 {
         .unwrap_or_default()
 }
 
-pub fn is_available(family: &UiFontFamily, cx: &App) -> bool {
-    availability(cx).is_available(family)
-}
-
 /// Validate, apply, repaint, and persist one confirmed choice. Returns whether
 /// the effective family changed (re-selecting the current family is a no-op).
 pub fn set_family(family: UiFontFamily, cx: &mut App) -> bool {
@@ -520,14 +589,26 @@ enum Category {
     Code,
 }
 
+impl Category {
+    fn fixed_width_only(self) -> bool {
+        matches!(self, Self::Terminal)
+    }
+}
+
 fn set_category_family(family: UiFontFamily, category: Category, cx: &mut App) -> bool {
     let Some(state) = cx.try_global::<TypographyState>() else {
         return false;
     };
-    if !state.availability.is_available(&family) {
+    let fixed_width_only = category.fixed_width_only();
+    let selectable = if fixed_width_only {
+        state.availability.is_fixed_width_available(&family)
+    } else {
+        state.availability.is_available(&family)
+    };
+    if !selectable {
         return false;
     }
-    let effective = resolve_effective_mono(&family, &state.availability);
+    let effective = resolve_effective_mono(&family, &state.availability, fixed_width_only);
     let (current_requested, current_effective) = match category {
         Category::Terminal => (&state.terminal_requested, &state.terminal_effective),
         Category::Code => (&state.code_requested, &state.code_effective),
@@ -652,19 +733,78 @@ mod tests {
         let unavailable = UiFontFamily::Installed("MesloLGS NF".into());
         let availability = FontAvailability::all();
         assert_eq!(
-            resolve_effective_mono(&unavailable, &availability),
+            resolve_effective_mono(&unavailable, &availability, false),
             UiFontFamily::GeistMono
         );
         assert_eq!(
-            resolve_effective_mono(&unavailable, &availability.clone().without(&unavailable)),
+            resolve_effective_mono(
+                &unavailable,
+                &availability.clone().without(&unavailable),
+                true
+            ),
             UiFontFamily::GeistMono
         );
         // Only when the bundled mono face itself failed to register does a
         // fixed-width surface fall back to the interface family.
         let without_mono = availability.without(&UiFontFamily::GeistMono);
         assert_eq!(
-            resolve_effective_mono(&unavailable, &without_mono),
+            resolve_effective_mono(&unavailable, &without_mono, false),
             UiFontFamily::Geist
+        );
+    }
+
+    #[test]
+    fn advance_check_separates_bundled_mono_from_bundled_sans() {
+        for bytes in GEIST_MONO {
+            assert!(face_is_fixed_width(
+                &ttf_parser::Face::parse(bytes, 0).unwrap()
+            ));
+        }
+        for bytes in GEIST {
+            assert!(!face_is_fixed_width(
+                &ttf_parser::Face::parse(bytes, 0).unwrap()
+            ));
+        }
+    }
+
+    #[test]
+    fn terminal_catalog_drops_proportional_families() {
+        let availability = FontAvailability::all();
+        for proportional in [
+            UiFontFamily::Geist,
+            UiFontFamily::System,
+            UiFontFamily::Installed("Arial".into()),
+        ] {
+            assert!(availability.is_available(&proportional));
+            assert!(!availability.is_fixed_width_available(&proportional));
+            assert!(!availability.fixed_width_choices().contains(&proportional));
+        }
+        for fixed in [
+            UiFontFamily::GeistMono,
+            UiFontFamily::Installed("Menlo".into()),
+        ] {
+            assert!(availability.is_fixed_width_available(&fixed));
+            assert!(availability.fixed_width_choices().contains(&fixed));
+        }
+    }
+
+    #[test]
+    fn persisted_proportional_terminal_family_falls_back() {
+        let availability = FontAvailability::all();
+        // Written by a build before the terminal picker was constrained.
+        let persisted = UiFontFamily::Installed("Arial".into());
+        assert_eq!(
+            resolve_effective_mono(&persisted, &availability, true),
+            UiFontFamily::GeistMono
+        );
+        assert_eq!(
+            resolve_effective_mono(&UiFontFamily::System, &availability, true),
+            UiFontFamily::GeistMono
+        );
+        // The same value is still legal for code and diffs.
+        assert_eq!(
+            resolve_effective_mono(&persisted, &availability, false),
+            persisted
         );
     }
 

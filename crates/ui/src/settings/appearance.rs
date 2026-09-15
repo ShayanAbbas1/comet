@@ -36,9 +36,9 @@ struct ImportDialog {
     error: Option<SharedString>,
 }
 
-/// The three independently configurable font slots. Every slot draws from the
-/// same catalog: a user may want a nerd font in the terminal and a plain mono
-/// for diffs, so nothing here filters by monospace.
+/// The three independently configurable font slots. Interface and code/diff
+/// draw from the whole catalog — proportional faces are legal there. The
+/// terminal draws from the fixed-width subset only.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum FontKind {
     Ui,
@@ -73,8 +73,25 @@ impl FontKind {
     fn description(self) -> &'static str {
         match self {
             Self::Ui => "Menus, sidebars, and conversation text.",
-            Self::Terminal => "Terminal panes and shell output.",
+            Self::Terminal => "Terminal panes and shell output. Fixed-width families only.",
             Self::Code => "Code blocks, diffs, and workspace file editors.",
+        }
+    }
+
+    /// The catalog this slot may pick from. Only the terminal narrows: its
+    /// renderer positions cursor, selection, and hit-testing on an `m`-wide
+    /// cell grid, which a proportional family silently breaks.
+    fn choices_for(self, availability: &FontAvailability) -> &[UiFontFamily] {
+        match self {
+            Self::Terminal => availability.fixed_width_choices(),
+            _ => availability.choices(),
+        }
+    }
+
+    fn is_available_for(self, availability: &FontAvailability, family: &UiFontFamily) -> bool {
+        match self {
+            Self::Terminal => availability.is_fixed_width_available(family),
+            _ => availability.is_available(family),
         }
     }
 
@@ -292,7 +309,7 @@ impl AppearancePage {
 
     fn commit_font(&mut self, kind: FontKind, cx: &mut Context<Self>) {
         let family = self.selected_font(kind).clone();
-        if typography::is_available(&family, cx) {
+        if kind.is_available_for(&typography::availability(cx), &family) {
             kind.apply_family(family, cx);
             let effective = kind.effective(cx);
             self.set_selected_font(kind, effective);
@@ -378,14 +395,17 @@ impl AppearancePage {
         cx.notify();
     }
 
-    /// Families narrowed and ranked by the typed query. Every kind draws from
-    /// the same catalog, so the query alone decides what is visible.
+    /// This kind's catalog, narrowed and ranked by the typed query.
     fn visible_choices(
         &self,
+        kind: FontKind,
         availability: &FontAvailability,
         cx: &gpui::App,
     ) -> Vec<UiFontFamily> {
-        filter_families(self.font_search.read(cx).text(), availability.choices())
+        filter_families(
+            self.font_search.read(cx).text(),
+            kind.choices_for(availability),
+        )
     }
 
     /// The kind whose menu is open, if any. Opening one closes the others.
@@ -405,12 +425,12 @@ impl AppearancePage {
     /// cannot commit a family the query has already filtered out of existence.
     fn clamp_highlight(&mut self, kind: FontKind, cx: &mut Context<Self>) {
         let availability = typography::availability(cx);
-        let visible = self.visible_choices(&availability, cx);
+        let visible = self.visible_choices(kind, &availability, cx);
         if !visible.contains(self.selected_font(kind)) {
             let next = if visible.is_empty() {
                 kind.effective(cx)
             } else {
-                first_available(&visible, &availability)
+                first_available(&visible, kind, &availability)
             };
             self.set_selected_font(kind, next);
         }
@@ -541,20 +561,20 @@ impl AppearancePage {
         // Open: the filter input owns text and caret keys. Only navigation,
         // commit, and dismiss bubble out to us.
         let availability = typography::availability(cx);
-        let choices = self.visible_choices(&availability, cx);
+        let choices = self.visible_choices(kind, &availability, cx);
         let modifiers = event.keystroke.modifiers;
         let next = match (
             key,
             popover::classify_key(key, modifiers.platform, modifiers.control),
         ) {
             (_, popover::MenuKey::Up) => {
-                step_font(self.selected_font(kind), -1, &choices, &availability)
+                step_font(self.selected_font(kind), -1, &choices, kind, &availability)
             }
             (_, popover::MenuKey::Down) => {
-                step_font(self.selected_font(kind), 1, &choices, &availability)
+                step_font(self.selected_font(kind), 1, &choices, kind, &availability)
             }
-            ("home", _) => first_available(&choices, &availability),
-            ("end", _) => last_available(&choices, &availability),
+            ("home", _) => first_available(&choices, kind, &availability),
+            ("end", _) => last_available(&choices, kind, &availability),
             (_, popover::MenuKey::Enter) => {
                 self.commit_font(kind, cx);
                 return true;
@@ -831,6 +851,7 @@ fn step_font(
     current: &UiFontFamily,
     delta: isize,
     choices: &[UiFontFamily],
+    kind: FontKind,
     availability: &FontAvailability,
 ) -> UiFontFamily {
     if choices.is_empty() {
@@ -843,7 +864,7 @@ fn step_font(
     let mut ix = current + delta.signum();
     while (0..choices.len() as isize).contains(&ix) {
         let candidate = &choices[ix as usize];
-        if availability.is_available(candidate) {
+        if kind.is_available_for(availability, candidate) {
             return candidate.clone();
         }
         ix += delta.signum();
@@ -865,21 +886,38 @@ fn filter_families(query: &str, choices: &[UiFontFamily]) -> Vec<UiFontFamily> {
         .collect()
 }
 
-fn first_available(choices: &[UiFontFamily], availability: &FontAvailability) -> UiFontFamily {
+fn first_available(
+    choices: &[UiFontFamily],
+    kind: FontKind,
+    availability: &FontAvailability,
+) -> UiFontFamily {
     choices
         .iter()
-        .find(|family| availability.is_available(family))
+        .find(|family| kind.is_available_for(availability, family))
         .cloned()
-        .unwrap_or(UiFontFamily::System)
+        .unwrap_or_else(|| fallback_selection(kind))
 }
 
-fn last_available(choices: &[UiFontFamily], availability: &FontAvailability) -> UiFontFamily {
+fn last_available(
+    choices: &[UiFontFamily],
+    kind: FontKind,
+    availability: &FontAvailability,
+) -> UiFontFamily {
     choices
         .iter()
         .rev()
-        .find(|family| availability.is_available(family))
+        .find(|family| kind.is_available_for(availability, family))
         .cloned()
-        .unwrap_or(UiFontFamily::System)
+        .unwrap_or_else(|| fallback_selection(kind))
+}
+
+/// Highlight target when a kind's catalog offers nothing: System UI is
+/// proportional, so the terminal cannot land there.
+fn fallback_selection(kind: FontKind) -> UiFontFamily {
+    match kind {
+        FontKind::Terminal => UiFontFamily::GeistMono,
+        _ => UiFontFamily::System,
+    }
 }
 
 fn format_px(size: f32) -> String {
@@ -1427,13 +1465,13 @@ impl AppearancePage {
         let slug = kind.slug();
         let effective = kind.effective(cx);
         let selected = self.selected_font(kind).clone();
-        let visible = self.visible_choices(availability, cx);
+        let visible = self.visible_choices(kind, availability, cx);
         let filtered = !self.font_search.read(cx).text().trim().is_empty();
         let rows: Vec<AnyElement> = visible
             .into_iter()
             .enumerate()
             .map(|(ix, family)| {
-                let available = availability.is_available(&family);
+                let available = kind.is_available_for(availability, &family);
                 let active = family == effective;
                 let focused = family == selected;
                 let label = SharedString::from(family.label().to_owned());
@@ -3102,20 +3140,63 @@ mod tests {
     }
 
     #[test]
+    fn only_the_terminal_catalog_is_narrowed_to_fixed_width() {
+        let all = FontAvailability::all();
+        let terminal: Vec<_> = FontKind::Terminal
+            .choices_for(&all)
+            .iter()
+            .map(UiFontFamily::label)
+            .collect();
+        assert_eq!(terminal, ["Geist Mono", "Menlo"]);
+
+        for kind in [FontKind::Ui, FontKind::Code] {
+            assert_eq!(kind.choices_for(&all), all.choices());
+            assert!(kind.is_available_for(&all, &UiFontFamily::System));
+            assert!(kind.is_available_for(&all, &UiFontFamily::Installed("Arial".into())));
+        }
+        for proportional in [
+            UiFontFamily::System,
+            UiFontFamily::Geist,
+            UiFontFamily::Installed("Arial".into()),
+        ] {
+            assert!(!FontKind::Terminal.is_available_for(&all, &proportional));
+        }
+        assert!(FontKind::Terminal.is_available_for(&all, &UiFontFamily::GeistMono));
+        // A query that only matches proportional families leaves the terminal
+        // highlight on the bundled mono face rather than on System UI.
+        assert_eq!(
+            first_available(&[], FontKind::Terminal, &all),
+            UiFontFamily::GeistMono
+        );
+    }
+
+    #[test]
     fn font_keyboard_navigation_stops_at_edges_and_skips_unavailable() {
         let all = FontAvailability::all();
         let choices = all.choices().to_vec();
         assert_eq!(
-            step_font(&UiFontFamily::Geist, -1, &choices, &all),
+            step_font(&UiFontFamily::Geist, -1, &choices, FontKind::Ui, &all),
             UiFontFamily::Geist
         );
         assert_eq!(
-            step_font(&UiFontFamily::Installed("Menlo".into()), 1, &choices, &all),
+            step_font(
+                &UiFontFamily::Installed("Menlo".into()),
+                1,
+                &choices,
+                FontKind::Ui,
+                &all
+            ),
             UiFontFamily::Installed("Menlo".into())
         );
         let without_arial = all.without(&UiFontFamily::Installed("Arial".into()));
         assert_eq!(
-            step_font(&UiFontFamily::System, 1, &choices, &without_arial),
+            step_font(
+                &UiFontFamily::System,
+                1,
+                &choices,
+                FontKind::Ui,
+                &without_arial
+            ),
             UiFontFamily::Installed("Menlo".into())
         );
     }
@@ -3146,14 +3227,17 @@ mod tests {
         );
         // Stepping never escapes the filtered list.
         assert_eq!(
-            step_font(&UiFontFamily::System, 1, &matches, &all),
+            step_font(&UiFontFamily::System, 1, &matches, FontKind::Ui, &all),
             UiFontFamily::System
         );
         assert_eq!(
-            first_available(&matches, &all),
+            first_available(&matches, FontKind::Ui, &all),
             UiFontFamily::Installed("Menlo".into())
         );
-        assert_eq!(last_available(&matches, &all), UiFontFamily::System);
+        assert_eq!(
+            last_available(&matches, FontKind::Ui, &all),
+            UiFontFamily::System
+        );
     }
 
     #[test]
@@ -3271,5 +3355,40 @@ mod tests {
                 assert!(!page.font_menu(FontKind::Code).is_open());
             })
             .expect("window is open");
+    }
+
+    /// A settings file written before the terminal picker was constrained can
+    /// still name a proportional family; startup must not hand it to the grid.
+    #[gpui::test]
+    fn persisted_proportional_terminal_family_resolves_to_geist_mono(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| {
+            gpui_base::init(cx);
+            cx.set_global(Theme::dark());
+            typography::init(
+                UiFontFamily::Geist,
+                UiFontSize::default(),
+                UiFontFamily::Installed("Arial".into()),
+                typography::TERMINAL_FONT_SIZE_DEFAULT,
+                UiFontFamily::Installed("Arial".into()),
+                typography::CODE_FONT_SIZE_DEFAULT,
+                FontAvailability::all(),
+                cx,
+            );
+            assert_eq!(
+                typography::terminal_effective(cx),
+                UiFontFamily::GeistMono,
+                "proportional terminal family must fall back"
+            );
+            assert_eq!(
+                typography::code_effective(cx),
+                UiFontFamily::Installed("Arial".into()),
+                "code and diffs keep proportional picks"
+            );
+            // The setter path rejects the same family too.
+            assert!(!typography::set_terminal_family(UiFontFamily::System, cx));
+            assert_eq!(typography::terminal_effective(cx), UiFontFamily::GeistMono);
+        });
     }
 }

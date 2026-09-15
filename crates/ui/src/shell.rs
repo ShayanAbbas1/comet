@@ -3481,18 +3481,25 @@ impl Shell {
         self.settings.accent = crate::appearance::accent(cx);
         self.settings.surface = crate::appearance::surface(cx);
         self.sync_independent_settings(cx);
-        self.settings.ui_font_family = crate::typography::requested(cx);
-        self.settings.ui_font_size = crate::typography::font_size(cx);
         settings::replace(self.settings.clone(), SavePolicy::Debounced, cx);
     }
 
     /// Controls outside the Shell mutate these choices directly. A geometry
     /// save must never publish the Shell's older values over those selections.
+    /// The typography globals own the font choices but persist every change
+    /// immediately, so the central store is an equally canonical read and
+    /// keeps this block on a single source.
     fn sync_independent_settings(&mut self, cx: &App) {
         let current = settings::current(cx);
         self.settings.new_thread_composer_background = current.new_thread_composer_background;
         self.settings.new_thread_background_effect = current.new_thread_background_effect;
         self.settings.open_web_links_in_zeron = current.open_web_links_in_zeron;
+        self.settings.ui_font_family = current.ui_font_family;
+        self.settings.ui_font_size = current.ui_font_size;
+        self.settings.terminal_font_family = current.terminal_font_family;
+        self.settings.terminal_font_size = current.terminal_font_size;
+        self.settings.code_font_family = current.code_font_family;
+        self.settings.code_font_size = current.code_font_size;
     }
 
     fn retry_engine(&mut self, cx: &mut Context<Self>) {
@@ -11084,6 +11091,18 @@ mod exit_regressions {
             .enumerate()
         {
             let open_links_in_zeron = index % 2 == 0;
+            let terminal_family = if open_links_in_zeron {
+                crate::typography::UiFontFamily::System
+            } else {
+                crate::typography::UiFontFamily::Geist
+            };
+            let code_family = if open_links_in_zeron {
+                crate::typography::UiFontFamily::Geist
+            } else {
+                crate::typography::UiFontFamily::System
+            };
+            let terminal_size = 15.0 + index as f32;
+            let code_size = 11.0 + index as f32;
             window
                 .update(cx, |shell, _, cx| {
                     // Selection changes in Appearance, independently of the shell's
@@ -11093,22 +11112,32 @@ mod exit_regressions {
                     settings::set_new_thread_background_effect(effect, cx);
                     settings::update(settings::SavePolicy::Immediate, cx, |settings| {
                         settings.open_web_links_in_zeron = open_links_in_zeron;
+                        settings.terminal_font_family = terminal_family.clone();
+                        settings.terminal_font_size = terminal_size;
+                        settings.code_font_family = code_family.clone();
+                        settings.code_font_size = code_size;
                     });
                     for step in 0..3 {
                         shell.settings.sidebar_width = 290.0 + step as f32;
                         shell.settings.right_pane_width = 540.0 + step as f32;
                         shell.settings.terminal_height = 300.0 + step as f32;
                         shell.schedule_save(cx);
-                        assert_eq!(settings::current(cx).new_thread_background_effect, effect);
-                        assert_eq!(
-                            settings::current(cx).open_web_links_in_zeron,
-                            open_links_in_zeron
-                        );
+                        let current = settings::current(cx);
+                        assert_eq!(current.new_thread_background_effect, effect);
+                        assert_eq!(current.open_web_links_in_zeron, open_links_in_zeron);
+                        assert_eq!(current.terminal_font_family, terminal_family);
+                        assert_eq!(current.terminal_font_size, terminal_size);
+                        assert_eq!(current.code_font_family, code_family);
+                        assert_eq!(current.code_font_size, code_size);
                     }
                     settings::flush(cx);
                     let loaded = settings::UiSettings::load(dir.path());
                     assert_eq!(loaded.new_thread_background_effect, effect);
                     assert_eq!(loaded.open_web_links_in_zeron, open_links_in_zeron);
+                    assert_eq!(loaded.terminal_font_family, terminal_family);
+                    assert_eq!(loaded.terminal_font_size, terminal_size);
+                    assert_eq!(loaded.code_font_family, code_family);
+                    assert_eq!(loaded.code_font_size, code_size);
                     assert_eq!(loaded.sidebar_width, 292.0);
                     assert_eq!(loaded.right_pane_width, 542.0);
                     assert_eq!(loaded.terminal_height, 302.0);

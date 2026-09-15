@@ -87,11 +87,22 @@ pub const SPLIT_MARKER_WIDTH: f32 = 18.0;
 pub const SPLIT_DIVIDER_WIDTH: f32 = 1.0;
 const DIFF_TEXT_SIZE: f32 = 12.0;
 const DIFF_TAB_SIZE: usize = 4;
+/// One shared `code_font_size` setting drives several surfaces that never
+/// agreed on a size historically. Each scales off its own baseline so the
+/// default setting reproduces the size that surface always had, and a
+/// user-chosen size moves them all while keeping those proportions.
+const DIFF_TEXT_SIZE_RATIO: f32 = DIFF_TEXT_SIZE / crate::typography::CODE_FONT_SIZE_DEFAULT;
+
+/// Size of the painted diff body text, and the size the column measurement in
+/// [`DiffHorizontalGeometry::resolve`] must use: they desync otherwise.
+fn diff_text_size(theme: &Theme) -> f32 {
+    crate::typography::clamp_font_size(theme.code_font_size * DIFF_TEXT_SIZE_RATIO)
+}
 
 /// The row box and the painted line box must agree, or code clips once the
 /// user moves the code font size off [`DIFF_TEXT_SIZE`].
 fn diff_line_height(theme: &Theme) -> f32 {
-    theme.code_font_size * (DIFF_LINE_HEIGHT / DIFF_TEXT_SIZE)
+    diff_text_size(theme) * (DIFF_LINE_HEIGHT / DIFF_TEXT_SIZE)
 }
 
 const UNIFIED_CODE_PADDING_LEFT: f32 = 12.0;
@@ -296,8 +307,8 @@ impl DiffHorizontalGeometry {
         let font_id = window.text_system().resolve_font(&mono);
         let column_width = window
             .text_system()
-            .ch_advance(font_id, px(theme.code_font_size))
-            .unwrap_or(px(theme.code_font_size * 0.6))
+            .ch_advance(font_id, px(diff_text_size(theme)))
+            .unwrap_or(px(diff_text_size(theme) * 0.6))
             .as_f32();
         DiffHorizontalMetrics {
             max_text_width: self.max_code_columns as f32 * column_width,
@@ -4204,7 +4215,7 @@ fn code_text_viewport(
         })
         .pl(px(padding_left))
         .font_family(theme.font_mono.clone())
-        .text_size(px(theme.code_font_size))
+        .text_size(px(diff_text_size(theme)))
         .line_height(px(diff_line_height(theme)))
         .map(|el| {
             if wrapped {
@@ -4360,7 +4371,7 @@ fn diff_line_row(
                 .flex_none()
                 .flex()
                 .justify_center()
-                .text_size(px(theme.code_font_size))
+                .text_size(px(diff_text_size(theme)))
                 .line_height(px(diff_line_height(theme)))
                 .text_color(marker_color)
                 .font_family(theme.font_mono.clone())
@@ -4499,7 +4510,7 @@ fn split_line_cell(
                 .flex_none()
                 .flex()
                 .justify_center()
-                .text_size(px(theme.code_font_size))
+                .text_size(px(diff_text_size(theme)))
                 .line_height(px(diff_line_height(theme)))
                 .text_color(marker_color)
                 .font_family(theme.font_mono.clone())
@@ -6007,6 +6018,31 @@ rename to new_name.rs
                 .iter()
                 .any(|span| span.kind == zeron_syntax::HighlightKind::Function)
         );
+    }
+
+    /// The regression this guards: rendering the diff at the raw shared
+    /// setting silently enlarged it from 12.0 to 12.5 on a fresh install.
+    #[test]
+    fn the_default_code_font_size_reproduces_the_historical_diff_size() {
+        let theme = Theme::dark();
+        assert_eq!(
+            theme.code_font_size,
+            crate::typography::CODE_FONT_SIZE_DEFAULT
+        );
+        assert_eq!(diff_text_size(&theme), DIFF_TEXT_SIZE);
+        assert_eq!(diff_line_height(&theme), DIFF_LINE_HEIGHT);
+    }
+
+    #[test]
+    fn scaled_diff_sizes_keep_their_proportions_and_stay_clamped() {
+        let mut theme = Theme::dark();
+        theme.code_font_size = 2.0 * crate::typography::CODE_FONT_SIZE_DEFAULT;
+        assert_eq!(diff_text_size(&theme), 2.0 * DIFF_TEXT_SIZE);
+        assert_eq!(diff_line_height(&theme), 2.0 * DIFF_LINE_HEIGHT);
+
+        theme.code_font_size = crate::typography::FONT_SIZE_MAX;
+        assert!(diff_text_size(&theme) <= crate::typography::FONT_SIZE_MAX);
+        assert!(diff_text_size(&theme) >= crate::typography::FONT_SIZE_MIN);
     }
 
     #[test]

@@ -2340,6 +2340,19 @@ mod tests {
     use super::*;
     use crate::markdown::parser::{InlineStyle, parse_full};
 
+    /// Markdown code blocks are the surface the shared setting's default was
+    /// taken from, so they scale 1:1 and need no ratio of their own.
+    #[test]
+    fn the_default_code_font_size_reproduces_the_historical_code_block_size() {
+        assert_eq!(CODE_TEXT_SIZE, crate::typography::CODE_FONT_SIZE_DEFAULT);
+        let theme = crate::theme::Theme::dark();
+        assert_eq!(theme.code_font_size, CODE_TEXT_SIZE);
+        assert_eq!(
+            theme.code_font_size * CODE_LINE_HEIGHT_RATIO,
+            CODE_LINE_HEIGHT
+        );
+    }
+
     #[test]
     fn code_block_indices_include_nested_quotes_and_lists() {
         let quoted = parse_full("> ```rust\n> let x = 1;\n> ```\n");
