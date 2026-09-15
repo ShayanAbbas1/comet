@@ -303,72 +303,38 @@ impl DiffHorizontalGeometry {
     }
 }
 
-fn shaped_width(text: &str, mono: &gpui::Font, size: gpui::Pixels, window: &Window) -> f32 {
-    let text = SharedString::from(text.to_string());
-    let run = gpui::TextRun {
-        len: text.len(),
-        font: mono.clone(),
-        color: gpui::black(),
-        background_color: None,
-        underline: None,
-        strikethrough: None,
-    };
-    window
-        .text_system()
-        .shape_line(text, size, &[run], None)
-        .width()
-        .as_f32()
-}
-
-/// Painted extent of the widest line, for the font and size actually in use.
-///
-/// `columns × ch_advance` is the exact extent only for ASCII in a genuinely
-/// fixed-width face. The code/diff catalog accepts any family, and even a mono
-/// family resolves CJK/emoji through fallback faces with their own advances —
-/// both shape wider than the column estimate, and [`code_text_viewport`] fixes
-/// the content box to this number and clips it, so under-measuring hides the
-/// end of a line with no way to scroll to it. Over-measuring only buys empty
-/// scroll space, so the estimate is kept as a floor.
-///
-// ponytail: O(lines) shaping, once per file per typography change and only for
-// files the user actually scrolls into view; a fixed-width family skips it for
-// every ASCII line. Move it to the background executor if a huge diff in a
-// proportional family ever hitches on first paint.
-fn max_shaped_text_width(file: &FileDiff, theme: &Theme, window: &Window, cx: &App) -> f32 {
+/// Measure the same runs the row paints. Color boundaries can break kerning
+/// and ligatures on native platforms even when every run uses the same font.
+fn max_shaped_text_width(
+    file: &FileDiff,
+    highlights: Option<&DiffHighlights>,
+    theme: &Theme,
+    text_system: &gpui::WindowTextSystem,
+) -> f32 {
     let mono = font(theme.font_mono.clone());
     let size = px(diff_text_size(theme));
-    let font_id = window.text_system().resolve_font(&mono);
-    let column_width = window
-        .text_system()
-        .ch_advance(font_id, size)
+    let column_width = text_system
+        .ch_advance(text_system.resolve_font(&mono), size)
         .unwrap_or(size * 0.6)
         .as_f32();
-    let fixed_width = crate::typography::availability(cx)
-        .is_fixed_width_available(&crate::typography::code_effective(cx));
-    // Tabs are painted raw, so the shaper — not [`DIFF_TAB_SIZE`] — decides
-    // their advance. One probe says whether the column estimate still bounds
-    // them (a tab expands to at least one column).
-    let tabs_fit_a_column = shaped_width("\t", &mono, size, window) <= column_width;
     file.hunks
         .iter()
         .flat_map(|hunk| &hunk.lines)
         .fold(0.0f32, |widest, line| {
-            let estimate = visual_columns(&line.text) as f32 * column_width;
-            let exact = fixed_width
-                && line.text.is_ascii()
-                && (tabs_fit_a_column || !line.text.contains('\t'));
-            let measured = if exact {
-                estimate
-            } else {
-                estimate.max(shaped_width(&line.text, &mono, size, window))
-            };
-            widest.max(measured)
+            let runs = line_runs(line, highlights, theme);
+            let shaped = text_system
+                .shape_line(line.text.clone().into(), size, &runs, None)
+                .width()
+                .as_f32();
+            // Preserve the old column estimate as a floor, including tab stops.
+            widest
+                .max(shaped)
+                .max(visual_columns(&line.text) as f32 * column_width)
         })
 }
 
 /// Count terminal-style display columns, including tab stops and wide
-/// Unicode glyphs. Syntax runs only recolour the shared mono font, so this is
-/// the stable width input for every virtualized row.
+/// Unicode glyphs. This is only a floor; actual shaped runs determine the extent.
 fn visual_columns(text: &str) -> usize {
     text.chars().fold(0usize, |columns, ch| {
         if ch == '\t' {
@@ -1204,12 +1170,18 @@ fn full_highlights(
 // Entity
 // ---------------------------------------------------------------------------
 
+struct MeasuredDiffWidth {
+    key: (u32, u32, u32, SharedString),
+    // Retaining the Arc makes pointer identity safe against allocator reuse.
+    highlights: Option<Arc<DiffHighlights>>,
+    width: f32,
+}
+
 struct FileHorizontalState {
     geometry: DiffHorizontalGeometry,
     scroll: gpui::ScrollHandle,
-    /// Measured extent plus the typography it was measured with. Shaping a
-    /// whole file is far too costly to redo on every row of every frame.
-    measured: std::cell::Cell<Option<((u32, u32), f32)>>,
+    /// Shape once per file, typography/theme, and highlight revision.
+    measured: std::cell::RefCell<Option<MeasuredDiffWidth>>,
 }
 
 impl FileHorizontalState {
@@ -1217,31 +1189,47 @@ impl FileHorizontalState {
         Self {
             geometry: DiffHorizontalGeometry::from_file(file),
             scroll: gpui::ScrollHandle::new(),
-            measured: std::cell::Cell::new(None),
+            measured: std::cell::RefCell::new(None),
         }
     }
 
     fn metrics(
         &self,
         file: &FileDiff,
+        highlights: Option<&Arc<DiffHighlights>>,
         theme: &Theme,
-        window: &Window,
-        cx: &App,
+        text_system: &gpui::WindowTextSystem,
+        generation: u32,
     ) -> DiffHorizontalMetrics {
         let key = (
-            crate::typography::generation(cx),
+            generation,
+            crate::theme::style_generation(),
             diff_text_size(theme).to_bits(),
+            theme.font_mono.clone(),
         );
-        let max_text_width = match self.measured.get() {
-            Some((cached, width)) if cached == key => width,
-            _ => {
-                let width = max_shaped_text_width(file, theme, window, cx);
-                self.measured.set(Some((key, width)));
-                width
-            }
-        };
+        let mut cached = self.measured.borrow_mut();
+        let current = cached.as_ref().is_some_and(|cached| {
+            cached.key == key
+                && match (cached.highlights.as_ref(), highlights) {
+                    (None, None) => true,
+                    (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+                    _ => false,
+                }
+        });
+        if !current {
+            *cached = Some(MeasuredDiffWidth {
+                key,
+                highlights: highlights.cloned(),
+                width: max_shaped_text_width(
+                    file,
+                    highlights.map(AsRef::as_ref),
+                    theme,
+                    text_system,
+                ),
+            });
+        }
         DiffHorizontalMetrics {
-            max_text_width,
+            max_text_width: cached.as_ref().unwrap().width,
             max_gutter_width: self.geometry.max_gutter_width,
         }
     }
@@ -3171,11 +3159,18 @@ impl Changes {
             return gpui::Empty.into_any_element();
         };
         let theme = Theme::of(cx).clone();
-        let horizontal = &parsed.horizontal[row.file()];
+        let highlight = files
+            .get(row.file())
+            .and_then(|file| self.request_highlight(file, &parsed_key, cx));
+        let horizontal = &self.parsed.as_ref().unwrap().horizontal[row.file()];
         let code_width = match files.get(row.file()) {
-            Some(file) if !self.wrap_lines => {
-                DiffCodeWidth::Scrollable(horizontal.metrics(file, &theme, window, cx))
-            }
+            Some(file) if !self.wrap_lines => DiffCodeWidth::Scrollable(horizontal.metrics(
+                file,
+                highlight.as_ref(),
+                &theme,
+                window.text_system(),
+                crate::typography::generation(cx),
+            )),
             _ => DiffCodeWidth::Wrapped,
         };
         let code_scroll = DiffCodeScrollContext {
@@ -3216,7 +3211,6 @@ impl Changes {
                 let Some(file_diff) = files.get(file as usize) else {
                     return gpui::Empty.into_any_element();
                 };
-                let highlight = self.request_highlight(file_diff, &parsed_key, cx);
                 let Some(line) = file_diff
                     .hunks
                     .get(hunk as usize)
@@ -3274,7 +3268,6 @@ impl Changes {
                 let Some(file_diff) = files.get(file as usize) else {
                     return gpui::Empty.into_any_element();
                 };
-                let highlight = self.request_highlight(file_diff, &parsed_key, cx);
                 let Some(lines) = file_diff.hunks.get(hunk as usize).map(|h| &h.lines) else {
                     return gpui::Empty.into_any_element();
                 };
@@ -3406,7 +3399,6 @@ impl Changes {
                     return gpui::Empty.into_any_element();
                 };
                 let fold = self.folds.get(&file_diff.path).copied().unwrap_or_default();
-                let highlight = self.request_highlight(file_diff, &parsed_key, cx);
                 let (from, to) = (fold.from, fold.to);
                 // Only the revealable slice is built — the tween never pays
                 // for lines it cannot show.
@@ -5723,72 +5715,97 @@ rename to new_name.rs
         assert_eq!(split_total(narrow), split_total(wide));
     }
 
-    struct BlankView;
-
-    impl Render for BlankView {
-        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-            gpui::Empty
-        }
-    }
-
-    /// The code/diff catalog accepts proportional families, so the extent has
-    /// to come from shaping. Bundled Geist keeps this hermetic on CI, which
-    /// has no device fonts.
-    #[gpui::test]
-    fn wide_glyph_lines_stay_reachable_at_max_horizontal_scroll(cx: &mut gpui::TestAppContext) {
-        let wide = "W".repeat(100);
-        let files = parse_patch(&format!("diff --git a/x b/x\n@@ -1 +1 @@\n-old\n+{wide}\n"));
-        let file = files[0].clone();
-        let state = FileHorizontalState::new(&file);
-
-        cx.update(|cx| {
-            gpui_base::init(cx);
-            crate::typography::register_fonts(cx);
-        });
-        let window = cx.add_window(|_, _| BlankView);
-        window
-            .update(cx, |_, window, cx| {
-                let mut theme = Theme::dark();
-                theme.font_mono = "Geist".into();
-                let size = px(diff_text_size(&theme));
-                let mono = font(theme.font_mono.clone());
-                let shaped = shaped_width(&wide, &mono, size, window);
-                let column_width = window
-                    .text_system()
-                    .ch_advance(window.text_system().resolve_font(&mono), size)
-                    .unwrap()
-                    .as_f32();
-
-                // Guards the fixture itself: if Geist had not registered, the
-                // fallback could be fixed-width and the regression unprovable.
-                assert!(
-                    shaped > 100.0 * column_width,
-                    "expected a proportional face: shaped {shaped}, columns estimate {}",
-                    100.0 * column_width
-                );
-
-                let metrics = state.metrics(&file, &theme, window, cx);
-                assert!(metrics.max_text_width >= shaped);
-
-                // Max horizontal scroll exposes the content box minus the
-                // viewport, so the suffix is reachable exactly when the box
-                // holds the left padding plus the shaped line.
-                let gutter = gutter_width(&file);
-                assert!(
-                    metrics.unified_content_width(gutter) >= UNIFIED_CODE_PADDING_LEFT + shaped,
-                    "unified clips the line suffix"
-                );
-                assert!(
-                    metrics.split_content_width(gutter) >= SPLIT_CODE_PADDING_LEFT + shaped,
-                    "split clips the line suffix"
-                );
-
-                // Cached, and re-measured when typography moves.
-                assert_eq!(state.metrics(&file, &theme, window, cx), metrics);
-                theme.code_font_size *= 2.0;
-                assert!(state.metrics(&file, &theme, window, cx).max_text_width > shaped);
-            })
+    /// Uses the native font backend, not TestAppContext's simulated metrics.
+    #[test]
+    fn native_diff_font_geometry() {
+        let platform = gpui_platform::current_platform(true);
+        let text_system =
+            gpui::WindowTextSystem::new(Arc::new(gpui::TextSystem::new(platform.text_system())));
+        text_system
+            .add_fonts(
+                crate::typography::bundled_font_faces()
+                    .map(std::borrow::Cow::Borrowed)
+                    .collect(),
+            )
             .unwrap();
+        let mut theme = Theme::dark();
+        theme.font_mono = "Geist".into();
+        let wide = "W".repeat(100);
+        let source = format!("{wide}\n{}\n\t漢字🙂e\u{301}\n", "WWW(WWW);".repeat(200));
+        let patch = format!(
+            "diff --git a/x.ts b/x.ts\n@@ -0,0 +1,3 @@\n+{}",
+            source.trim_end_matches('\n').replace('\n', "\n+")
+        );
+        let files = parse_patch(&patch);
+        let file = &files[0];
+        let state = FileHorizontalState::new(file);
+        let highlight = Arc::new(DiffHighlights {
+            old: None,
+            new: Some(Arc::new(
+                zeron_syntax::highlight(zeron_syntax::HighlightRequest {
+                    source: &source,
+                    path: Some("x.ts"),
+                    fence_tag: None,
+                })
+                .unwrap(),
+            )),
+        });
+        let mono = font(theme.font_mono.clone());
+        let column = text_system
+            .ch_advance(text_system.resolve_font(&mono), px(12.))
+            .unwrap()
+            .as_f32();
+        let line = &file.hunks[0].lines[0];
+        let width = text_system
+            .shape_line(wide.into(), px(12.), &line_runs(line, None, &theme), None)
+            .width()
+            .as_f32();
+        assert!(
+            width > 100. * column * 1.1,
+            "requires a real proportional font: {width} vs {}",
+            100. * column
+        );
+
+        // Simulate plain -> excerpt -> full highlighting, including replacement
+        // while an old cached Arc is still alive. Every paint must be reachable.
+        for size in [12.5, 32., 8.] {
+            theme.code_font_size = size;
+            for highlights in [
+                None,
+                Some(highlight.clone()),
+                Some(Arc::new(DiffHighlights {
+                    old: None,
+                    new: highlight.new.clone(),
+                })),
+            ] {
+                let metrics = state.metrics(file, highlights.as_ref(), &theme, &text_system, 0);
+                for line in &file.hunks[0].lines {
+                    let runs = line_runs(line, highlights.as_deref(), &theme);
+                    let painted = text_system
+                        .shape_line(
+                            line.text.clone().into(),
+                            px(diff_text_size(&theme)),
+                            &runs,
+                            None,
+                        )
+                        .width()
+                        .as_f32();
+                    assert!(metrics.max_text_width >= painted);
+                    assert!(
+                        metrics.unified_content_width(gutter_width(file))
+                            >= UNIFIED_CODE_PADDING_LEFT + painted
+                    );
+                    assert!(
+                        metrics.split_content_width(gutter_width(file))
+                            >= SPLIT_CODE_PADDING_LEFT + painted
+                    );
+                }
+                assert_eq!(
+                    state.metrics(file, highlights.as_ref(), &theme, &text_system, 0),
+                    metrics
+                );
+            }
+        }
     }
 
     #[test]

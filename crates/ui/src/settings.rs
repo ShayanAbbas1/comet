@@ -587,8 +587,8 @@ pub struct UiSettings {
     pub ui_font_family: crate::typography::UiFontFamily,
     /// Base size for interface and conversational prose.
     pub ui_font_size: crate::typography::UiFontSize,
-    /// Terminal family and absolute pixel size. Not restricted to monospace:
-    /// nerd fonts and proportional faces are legal choices.
+    /// Terminal family and absolute pixel size. Only fixed-width families
+    /// qualify, including compatible Nerd Fonts.
     pub terminal_font_family: crate::typography::UiFontFamily,
     pub terminal_font_size: f32,
     /// Family and absolute pixel size for code, diffs, and file editors.
