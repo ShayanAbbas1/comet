@@ -87,6 +87,13 @@ pub const SPLIT_MARKER_WIDTH: f32 = 18.0;
 pub const SPLIT_DIVIDER_WIDTH: f32 = 1.0;
 const DIFF_TEXT_SIZE: f32 = 12.0;
 const DIFF_TAB_SIZE: usize = 4;
+
+/// The row box and the painted line box must agree, or code clips once the
+/// user moves the code font size off [`DIFF_TEXT_SIZE`].
+fn diff_line_height(theme: &Theme) -> f32 {
+    theme.code_font_size * (DIFF_LINE_HEIGHT / DIFF_TEXT_SIZE)
+}
+
 const UNIFIED_CODE_PADDING_LEFT: f32 = 12.0;
 const SPLIT_CODE_PADDING_LEFT: f32 = 6.0;
 /// Breathing room after the widest source line when scrolled fully right.
@@ -289,8 +296,8 @@ impl DiffHorizontalGeometry {
         let font_id = window.text_system().resolve_font(&mono);
         let column_width = window
             .text_system()
-            .ch_advance(font_id, px(DIFF_TEXT_SIZE))
-            .unwrap_or(px(DIFF_TEXT_SIZE * 0.6))
+            .ch_advance(font_id, px(theme.code_font_size))
+            .unwrap_or(px(theme.code_font_size * 0.6))
             .as_f32();
         DiffHorizontalMetrics {
             max_text_width: self.max_code_columns as f32 * column_width,
@@ -613,7 +620,7 @@ pub fn truncate_file_lines(file: &mut FileDiff, max_lines: usize) {
 /// Analytic expanded-body height — drives the 180 ms fold tween without
 /// measurement.
 pub fn body_height(file: &FileDiff) -> f32 {
-    body_height_with(file, &[], None, DiffMode::Unified)
+    body_height_with(file, &[], None, DiffMode::Unified, DIFF_LINE_HEIGHT)
 }
 
 pub fn body_height_with(
@@ -621,10 +628,11 @@ pub fn body_height_with(
     comments: &[ReviewComment],
     draft: Option<(CommentSide, u32)>,
     mode: DiffMode,
+    line_h: f32,
 ) -> f32 {
     body_rows(0, file, comments, draft, mode)
         .iter()
-        .map(|row| row.height(comments))
+        .map(|row| row.height(comments, line_h))
         .sum()
 }
 
@@ -1238,12 +1246,12 @@ impl DiffRow {
 
     /// `FoldingBody` is height-animated, so it reports 0 and never lands in a
     /// height sum.
-    fn height(self, comments: &[ReviewComment]) -> f32 {
+    fn height(self, comments: &[ReviewComment], line_h: f32) -> f32 {
         match self {
             DiffRow::FileHeader { .. } => FILE_HEADER_HEIGHT,
             DiffRow::Notice { .. } => NOTICE_HEIGHT,
             DiffRow::HunkHeader { .. } => HUNK_HEADER_HEIGHT,
-            DiffRow::Line { .. } | DiffRow::SplitLine { .. } => DIFF_LINE_HEIGHT,
+            DiffRow::Line { .. } | DiffRow::SplitLine { .. } => line_h,
             DiffRow::CommentCard { card, .. } => comments
                 .get(card as usize)
                 .map(|comment| comments::card_height(&comment.body))
@@ -2230,9 +2238,10 @@ impl Changes {
                 // The uniform hint keeps offsets for never-rendered rows
                 // sane (most rows ARE lines); real heights land as rows
                 // render.
+                let row_height = px(diff_line_height(Theme::of(cx)));
                 changes
                     .list
-                    .reset_with_uniform_height(rows.len(), px(DIFF_LINE_HEIGHT));
+                    .reset_with_uniform_height(rows.len(), row_height);
                 changes.rows = rows;
                 changes.row_ranges = ranges;
                 changes.parsed = Some(ParsedDiff {
@@ -2326,6 +2335,7 @@ impl Changes {
             &self.comments_for(&file.path, cx),
             self.draft_anchor_in(&file.path),
             self.mode,
+            diff_line_height(Theme::of(cx)),
         );
         let fold = self.folds.entry(file.path.clone()).or_default();
         let currently_collapsed = fold.collapsed;
@@ -2561,8 +2571,8 @@ impl Changes {
             self.mode,
             |ix| collapsed.get(ix).copied().unwrap_or(false),
         );
-        self.list
-            .reset_with_uniform_height(rows.len(), px(DIFF_LINE_HEIGHT));
+        let row_height = px(diff_line_height(Theme::of(cx)));
+        self.list.reset_with_uniform_height(rows.len(), row_height);
         self.rows = rows;
         self.row_ranges = ranges;
         if let Some(start) = anchor_file
@@ -3256,7 +3266,7 @@ impl Changes {
                     (Some(cell), None) => cell.into_any_element(),
                     (None, _) => split_filler().into_any_element(),
                 };
-                split_row(left, right, self.wrap_lines).into_any_element()
+                split_row(left, right, self.wrap_lines, &theme).into_any_element()
             }
             DiffRow::CommentCard { file, card } => {
                 let Some(file_diff) = files.get(file as usize) else {
@@ -4194,8 +4204,8 @@ fn code_text_viewport(
         })
         .pl(px(padding_left))
         .font_family(theme.font_mono.clone())
-        .text_size(px(DIFF_TEXT_SIZE))
-        .line_height(px(DIFF_LINE_HEIGHT))
+        .text_size(px(theme.code_font_size))
+        .line_height(px(diff_line_height(theme)))
         .map(|el| {
             if wrapped {
                 el.whitespace_normal()
@@ -4207,7 +4217,7 @@ fn code_text_viewport(
     let viewport = div()
         .flex_1()
         .min_w_0()
-        .min_h(px(DIFF_LINE_HEIGHT))
+        .min_h(px(diff_line_height(theme)))
         .overflow_hidden()
         .child(content);
     if wrapped {
@@ -4282,7 +4292,7 @@ fn diff_line_row(
             .flex_none()
             .font_family(theme.font_mono.clone())
             .text_size(px(11.0))
-            .line_height(px(DIFF_LINE_HEIGHT))
+            .line_height(px(diff_line_height(theme)))
             .text_color(color)
             .flex()
             .justify_end()
@@ -4308,9 +4318,9 @@ fn diff_line_row(
     div()
         .map(|el| {
             if wrapped {
-                el.min_h(px(DIFF_LINE_HEIGHT))
+                el.min_h(px(diff_line_height(theme)))
             } else {
-                el.h(px(DIFF_LINE_HEIGHT))
+                el.h(px(diff_line_height(theme)))
             }
         })
         .w_full()
@@ -4350,8 +4360,8 @@ fn diff_line_row(
                 .flex_none()
                 .flex()
                 .justify_center()
-                .text_size(px(DIFF_TEXT_SIZE))
-                .line_height(px(DIFF_LINE_HEIGHT))
+                .text_size(px(theme.code_font_size))
+                .line_height(px(diff_line_height(theme)))
                 .text_color(marker_color)
                 .font_family(theme.font_mono.clone())
                 .child(SharedString::from(marker)),
@@ -4373,7 +4383,7 @@ fn diff_line_row(
 /// mode it spans both halves.
 fn meta_line_row(text: &str, theme: &Theme, pad_left: f32) -> AnyElement {
     div()
-        .h(px(DIFF_LINE_HEIGHT))
+        .h(px(diff_line_height(theme)))
         .w_full()
         .flex_none()
         .flex()
@@ -4474,7 +4484,7 @@ fn split_line_cell(
                 .flex_none()
                 .font_family(theme.font_mono.clone())
                 .text_size(px(11.0))
-                .line_height(px(DIFF_LINE_HEIGHT))
+                .line_height(px(diff_line_height(theme)))
                 .text_color(number_color)
                 .flex()
                 .justify_end()
@@ -4489,8 +4499,8 @@ fn split_line_cell(
                 .flex_none()
                 .flex()
                 .justify_center()
-                .text_size(px(DIFF_TEXT_SIZE))
-                .line_height(px(DIFF_LINE_HEIGHT))
+                .text_size(px(theme.code_font_size))
+                .line_height(px(diff_line_height(theme)))
                 .text_color(marker_color)
                 .font_family(theme.font_mono.clone())
                 .child(SharedString::from(marker)),
@@ -4518,13 +4528,13 @@ fn split_filler() -> gpui::Div {
 }
 
 /// Compose the two halves with the centre hairline.
-fn split_row(left: AnyElement, right: AnyElement, wrapped: bool) -> gpui::Div {
+fn split_row(left: AnyElement, right: AnyElement, wrapped: bool, theme: &Theme) -> gpui::Div {
     div()
         .map(|el| {
             if wrapped {
-                el.min_h(px(DIFF_LINE_HEIGHT))
+                el.min_h(px(diff_line_height(theme)))
             } else {
-                el.h(px(DIFF_LINE_HEIGHT))
+                el.h(px(diff_line_height(theme)))
             }
         })
         .w_full()
@@ -4693,14 +4703,14 @@ fn render_file_body_upto(
                                 .as_ref()
                                 .map(|scroll| scroll.slot(format_args!("{hunk_ix}-{line_ix}"))),
                         ));
-                        y += DIFF_LINE_HEIGHT;
+                        y += diff_line_height(theme);
                     }
                 }
                 DiffMode::Split => {
                     // Pair only what the clip can still reveal: the unified
                     // arm breaks out of a lazy walk, so the split arm must not
                     // materialize the whole hunk first.
-                    let budget = ((max_px - y) / DIFF_LINE_HEIGHT).ceil().max(0.0) as usize;
+                    let budget = ((max_px - y) / diff_line_height(theme)).ceil().max(0.0) as usize;
                     for (pair_ix, (left, right)) in split_pairs_upto(&hunk.lines, budget)
                         .into_iter()
                         .enumerate()
@@ -4739,10 +4749,10 @@ fn render_file_body_upto(
                                 theme,
                                 2.0 * (ACCENT_BAR_WIDTH + gutter_px),
                             ),
-                            None => split_row(cell(left, true), cell(right, false), wrapped)
+                            None => split_row(cell(left, true), cell(right, false), wrapped, theme)
                                 .into_any_element(),
                         });
-                        y += DIFF_LINE_HEIGHT;
+                        y += diff_line_height(theme);
                     }
                 }
             }
@@ -5413,7 +5423,7 @@ rename to new_name.rs
 
         // Heights stay analytic — the fold tween needs no measurement.
         assert_eq!(
-            body_height_with(&files[0], &[], None, DiffMode::Split),
+            body_height_with(&files[0], &[], None, DiffMode::Split, DIFF_LINE_HEIGHT),
             2.0 * HUNK_HEADER_HEIGHT + 6.0 * DIFF_LINE_HEIGHT + BODY_BOTTOM_PAD
         );
     }

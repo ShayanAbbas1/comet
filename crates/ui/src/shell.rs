@@ -36,7 +36,7 @@ use crate::motion::{self, AnimationExt as _, MotionSpec, RESIZE, SPLASH_OUT, TAB
 use crate::popover::{self, Loadable};
 use crate::rail;
 use crate::settings::accounts::AccountsPage;
-use crate::settings::appearance::AppearancePage;
+use crate::settings::appearance::{AppearancePage, AppearanceSettingsEvent};
 use crate::settings::archived::ArchivedPage;
 use crate::settings::devices::DevicesPage;
 use crate::settings::files::{FilesSettingsEvent, FilesSettingsPage};
@@ -1377,6 +1377,7 @@ pub struct Shell {
     shortcuts_sub: Option<Subscription>,
     notifications_sub: Option<Subscription>,
     files_settings_sub: Option<Subscription>,
+    appearance_settings_sub: Option<Subscription>,
     /// Session-row context menu, including the Copy submenu.
     chat_menu: popover::Popup<ChatMenuState>,
     rename_dialog: Option<RenameChatDialog>,
@@ -1740,6 +1741,7 @@ impl Shell {
             shortcuts_sub: None,
             notifications_sub: None,
             files_settings_sub: None,
+            appearance_settings_sub: None,
             chat_menu: popover::Popup::default(),
             rename_dialog: None,
             delete_confirm: None,
@@ -2554,8 +2556,11 @@ impl Shell {
         cx.notify();
     }
 
-    fn set_files_editor_font_size(&mut self, editor_font_size: f32, cx: &mut Context<Self>) {
-        self.settings.files_editor_font_size = editor_font_size;
+    /// Push a new code size into every open file surface. Called by the
+    /// Appearance settings page, which owns the control. The typography
+    /// global is the canonical store and persists on its own; this only
+    /// propagates the change to already-open surfaces.
+    pub(crate) fn set_code_font_size(&mut self, code_font_size: f32, cx: &mut Context<Self>) {
         let surfaces = self
             .files
             .values()
@@ -2564,10 +2569,9 @@ impl Shell {
             .collect::<Vec<_>>();
         for surface in surfaces {
             surface.update(cx, |surface, cx| {
-                surface.set_editor_font_size(editor_font_size, cx)
+                surface.set_editor_font_size(code_font_size, cx)
             });
         }
-        self.schedule_save(cx);
         cx.notify();
     }
 
@@ -2730,7 +2734,7 @@ impl Shell {
         if !self.files.contains_key(&key) {
             let autosave_enabled = self.settings.files_autosave_enabled;
             let delay = self.settings.files_autosave_delay_ms;
-            let editor_font_size = self.settings.files_editor_font_size;
+            let editor_font_size = crate::typography::code_font_size(cx);
             let word_wrap = self.settings.files_word_wrap;
             let show_all_files = self.settings.files_show_all;
             let files = cx.new(|cx| {
@@ -2806,7 +2810,7 @@ impl Shell {
                 path.clone(),
                 self.settings.files_autosave_enabled,
                 self.settings.files_autosave_delay_ms,
-                self.settings.files_editor_font_size,
+                crate::typography::code_font_size(cx),
                 self.settings.files_word_wrap,
                 self.settings.files_show_all,
                 cx,
@@ -3669,7 +3673,16 @@ impl Shell {
             }
             SettingsSection::Appearance => {
                 if self.appearance_page.is_none() {
-                    self.appearance_page = Some(cx.new(AppearancePage::new));
+                    let page = cx.new(AppearancePage::new);
+                    self.appearance_settings_sub = Some(cx.subscribe(
+                        &page,
+                        |this: &mut Shell, _, event: &AppearanceSettingsEvent, cx| match *event {
+                            AppearanceSettingsEvent::CodeFontSizeChanged(size) => {
+                                this.set_code_font_size(size, cx);
+                            }
+                        },
+                    ));
+                    self.appearance_page = Some(page);
                 }
                 match &self.appearance_page {
                     Some(page) => page.clone().into_any_element(),
@@ -3682,7 +3695,6 @@ impl Shell {
                         FilesSettingsPage::new(
                             self.settings.files_autosave_enabled,
                             self.settings.files_autosave_delay_ms,
-                            self.settings.files_editor_font_size,
                             self.settings.files_word_wrap,
                             self.settings.files_show_all,
                             cx,
@@ -3715,9 +3727,6 @@ impl Shell {
                                 }
                                 this.schedule_save(cx);
                                 cx.notify();
-                            }
-                            FilesSettingsEvent::EditorFontSizeChanged(editor_font_size) => {
-                                this.set_files_editor_font_size(editor_font_size, cx);
                             }
                             FilesSettingsEvent::WordWrapChanged(word_wrap) => {
                                 this.set_files_word_wrap(word_wrap, window, cx);

@@ -119,6 +119,16 @@ pub const fn ui_rems(pixels_at_default: f32) -> Rems {
     rems(pixels_at_default / 16.0)
 }
 
+pub const CODE_FONT_SIZE_DEFAULT: f32 = 12.5;
+pub const TERMINAL_FONT_SIZE_DEFAULT: f32 = 13.0;
+pub const FONT_SIZE_MIN: f32 = 8.0;
+pub const FONT_SIZE_MAX: f32 = 32.0;
+
+/// Clamp an absolute code/terminal pixel size into the supported range.
+pub fn clamp_font_size(size: f32) -> f32 {
+    size.clamp(FONT_SIZE_MIN, FONT_SIZE_MAX)
+}
+
 /// Which catalog families successfully registered during this process.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FontAvailability {
@@ -164,6 +174,17 @@ impl FontAvailability {
         }
     }
 
+    /// Code and terminal degrade to the bundled mono face instead of the
+    /// interface sans: a device-local pick that later disappears should not
+    /// silently turn fixed-width surfaces proportional.
+    fn fallback_mono(&self) -> UiFontFamily {
+        if self.geist_mono {
+            UiFontFamily::GeistMono
+        } else {
+            self.fallback()
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn without(mut self, family: &UiFontFamily) -> Self {
         match family {
@@ -187,12 +208,21 @@ impl Default for FontAvailability {
 }
 
 /// Requested and effective typography for the process.
+///
+/// The three categories (interface, terminal, code/diff) pick from the same
+/// catalog: nerd fonts and proportional faces are legal everywhere on purpose.
 pub struct TypographyState {
     pub requested: UiFontFamily,
     pub effective: UiFontFamily,
     pub size: UiFontSize,
+    pub terminal_requested: UiFontFamily,
+    pub terminal_effective: UiFontFamily,
+    pub terminal_font_size: f32,
+    pub code_requested: UiFontFamily,
+    pub code_effective: UiFontFamily,
+    pub code_font_size: f32,
     pub availability: FontAvailability,
-    /// Monotonic signal for layout caches whose measurements depend on UI
+    /// Monotonic signal for layout caches whose measurements depend on
     /// typography. Kept separate from the theme style generation so palette
     /// changes do not force expensive list remeasurement.
     generation: u32,
@@ -300,18 +330,42 @@ fn resolve_effective(requested: &UiFontFamily, availability: &FontAvailability) 
     }
 }
 
+fn resolve_effective_mono(
+    requested: &UiFontFamily,
+    availability: &FontAvailability,
+) -> UiFontFamily {
+    if availability.is_available(requested) {
+        requested.clone()
+    } else {
+        availability.fallback_mono()
+    }
+}
+
 /// Install typography state before appearance builds the first [`crate::theme::Theme`].
+#[allow(clippy::too_many_arguments)]
 pub fn init(
     requested: UiFontFamily,
     size: UiFontSize,
+    terminal_requested: UiFontFamily,
+    terminal_font_size: f32,
+    code_requested: UiFontFamily,
+    code_font_size: f32,
     availability: FontAvailability,
     cx: &mut App,
 ) {
     let effective = resolve_effective(&requested, &availability);
+    let terminal_effective = resolve_effective_mono(&terminal_requested, &availability);
+    let code_effective = resolve_effective_mono(&code_requested, &availability);
     cx.set_global(TypographyState {
         requested,
         effective,
         size: size.normalized(),
+        terminal_requested,
+        terminal_effective,
+        terminal_font_size: clamp_font_size(terminal_font_size),
+        code_requested,
+        code_effective,
+        code_font_size: clamp_font_size(code_font_size),
         availability,
         generation: 0,
     });
@@ -331,6 +385,50 @@ pub fn effective(cx: &App) -> UiFontFamily {
 
 pub fn effective_family_name(cx: &App) -> SharedString {
     effective(cx).family_name().into()
+}
+
+pub fn terminal_requested(cx: &App) -> UiFontFamily {
+    cx.try_global::<TypographyState>()
+        .map(|state| state.terminal_requested.clone())
+        .unwrap_or(UiFontFamily::GeistMono)
+}
+
+pub fn terminal_effective(cx: &App) -> UiFontFamily {
+    cx.try_global::<TypographyState>()
+        .map(|state| state.terminal_effective.clone())
+        .unwrap_or(UiFontFamily::GeistMono)
+}
+
+pub fn terminal_effective_family_name(cx: &App) -> SharedString {
+    terminal_effective(cx).family_name().into()
+}
+
+pub fn terminal_font_size(cx: &App) -> f32 {
+    cx.try_global::<TypographyState>()
+        .map(|state| state.terminal_font_size)
+        .unwrap_or(TERMINAL_FONT_SIZE_DEFAULT)
+}
+
+pub fn code_requested(cx: &App) -> UiFontFamily {
+    cx.try_global::<TypographyState>()
+        .map(|state| state.code_requested.clone())
+        .unwrap_or(UiFontFamily::GeistMono)
+}
+
+pub fn code_effective(cx: &App) -> UiFontFamily {
+    cx.try_global::<TypographyState>()
+        .map(|state| state.code_effective.clone())
+        .unwrap_or(UiFontFamily::GeistMono)
+}
+
+pub fn code_effective_family_name(cx: &App) -> SharedString {
+    code_effective(cx).family_name().into()
+}
+
+pub fn code_font_size(cx: &App) -> f32 {
+    cx.try_global::<TypographyState>()
+        .map(|state| state.code_font_size)
+        .unwrap_or(CODE_FONT_SIZE_DEFAULT)
 }
 
 pub fn font_size(cx: &App) -> UiFontSize {
@@ -379,25 +477,120 @@ pub fn set_family(family: UiFontFamily, cx: &mut App) -> bool {
 
     if effective_changed {
         state.generation = state.generation.wrapping_add(1);
-        crate::theme::bump_style_generation();
-        let appearance = crate::theme::current_appearance();
-        let themes = crate::appearance::themes(cx);
-        crate::theme::Theme::install_selection(
-            appearance,
-            themes.variant_id(match appearance {
-                crate::theme::Appearance::Dark => zeron_theme::Appearance::Dark,
-                crate::theme::Appearance::Light => zeron_theme::Appearance::Light,
-            }),
-            crate::appearance::accent(cx),
-            crate::appearance::surface(cx),
-            cx,
-        );
-        cx.refresh_windows();
+        reinstall_theme(cx);
     }
     settings::update(SavePolicy::Immediate, cx, |settings| {
         settings.ui_font_family = family;
     });
     effective_changed
+}
+
+/// Rebuild the [`crate::theme::Theme`] so it picks up the new families and
+/// sizes it carries, then repaint.
+fn reinstall_theme(cx: &mut App) {
+    crate::theme::bump_style_generation();
+    let appearance = crate::theme::current_appearance();
+    let themes = crate::appearance::themes(cx);
+    crate::theme::Theme::install_selection(
+        appearance,
+        themes.variant_id(match appearance {
+            crate::theme::Appearance::Dark => zeron_theme::Appearance::Dark,
+            crate::theme::Appearance::Light => zeron_theme::Appearance::Light,
+        }),
+        crate::appearance::accent(cx),
+        crate::appearance::surface(cx),
+        cx,
+    );
+    cx.refresh_windows();
+}
+
+/// Apply and persist the terminal family. Returns whether anything changed.
+pub fn set_terminal_family(family: UiFontFamily, cx: &mut App) -> bool {
+    set_category_family(family, Category::Terminal, cx)
+}
+
+/// Apply and persist the code/diff family. Returns whether anything changed.
+pub fn set_code_family(family: UiFontFamily, cx: &mut App) -> bool {
+    set_category_family(family, Category::Code, cx)
+}
+
+#[derive(Clone, Copy)]
+enum Category {
+    Terminal,
+    Code,
+}
+
+fn set_category_family(family: UiFontFamily, category: Category, cx: &mut App) -> bool {
+    let Some(state) = cx.try_global::<TypographyState>() else {
+        return false;
+    };
+    if !state.availability.is_available(&family) {
+        return false;
+    }
+    let effective = resolve_effective_mono(&family, &state.availability);
+    let (current_requested, current_effective) = match category {
+        Category::Terminal => (&state.terminal_requested, &state.terminal_effective),
+        Category::Code => (&state.code_requested, &state.code_effective),
+    };
+    if *current_requested == family && *current_effective == effective {
+        return false;
+    }
+
+    let state = cx.global_mut::<TypographyState>();
+    state.generation = state.generation.wrapping_add(1);
+    match category {
+        Category::Terminal => {
+            state.terminal_requested = family.clone();
+            state.terminal_effective = effective;
+        }
+        Category::Code => {
+            state.code_requested = family.clone();
+            state.code_effective = effective;
+        }
+    }
+    reinstall_theme(cx);
+    settings::update(SavePolicy::Immediate, cx, |settings| match category {
+        Category::Terminal => settings.terminal_font_family = family,
+        Category::Code => settings.code_font_family = family,
+    });
+    true
+}
+
+/// Apply and persist the terminal pixel size. Returns whether it changed.
+pub fn set_terminal_font_size(size: f32, cx: &mut App) -> bool {
+    set_category_font_size(size, Category::Terminal, cx)
+}
+
+/// Apply and persist the code/diff pixel size. Returns whether it changed.
+pub fn set_code_font_size(size: f32, cx: &mut App) -> bool {
+    set_category_font_size(size, Category::Code, cx)
+}
+
+fn set_category_font_size(size: f32, category: Category, cx: &mut App) -> bool {
+    let size = clamp_font_size(size);
+    let Some(state) = cx.try_global::<TypographyState>() else {
+        return false;
+    };
+    let current = match category {
+        Category::Terminal => state.terminal_font_size,
+        Category::Code => state.code_font_size,
+    };
+    if current == size {
+        return false;
+    }
+
+    let state = cx.global_mut::<TypographyState>();
+    state.generation = state.generation.wrapping_add(1);
+    match category {
+        Category::Terminal => state.terminal_font_size = size,
+        Category::Code => state.code_font_size = size,
+    }
+    reinstall_theme(cx);
+    settings::update(SavePolicy::Immediate, cx, |settings| match category {
+        Category::Terminal => settings.terminal_font_size = size,
+        Category::Code => settings.code_font_size = size,
+    });
+    true
 }
 
 /// Apply a supported UI size to the current window and persist it.
@@ -452,6 +645,27 @@ mod tests {
             UiFontFamily::Geist
         );
         assert!(availability.is_available(&UiFontFamily::System));
+    }
+
+    #[test]
+    fn unavailable_code_and_terminal_families_stay_monospaced() {
+        let unavailable = UiFontFamily::Installed("MesloLGS NF".into());
+        let availability = FontAvailability::all();
+        assert_eq!(
+            resolve_effective_mono(&unavailable, &availability),
+            UiFontFamily::GeistMono
+        );
+        assert_eq!(
+            resolve_effective_mono(&unavailable, &availability.clone().without(&unavailable)),
+            UiFontFamily::GeistMono
+        );
+        // Only when the bundled mono face itself failed to register does a
+        // fixed-width surface fall back to the interface family.
+        let without_mono = availability.without(&UiFontFamily::GeistMono);
+        assert_eq!(
+            resolve_effective_mono(&unavailable, &without_mono),
+            UiFontFamily::Geist
+        );
     }
 
     #[test]

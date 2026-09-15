@@ -3179,7 +3179,7 @@ impl FilesSurface {
                     .pr(px(18.0))
                     .when(!word_wrap, |element| element.whitespace_nowrap())
                     .font_family(theme.font_mono.clone())
-                    .text_size(px(11.5))
+                    .text_size(px(theme.code_font_size))
                     .child(gpui::StyledText::new(line.clone()).with_runs(runs)),
             )
             .into_any_element()
